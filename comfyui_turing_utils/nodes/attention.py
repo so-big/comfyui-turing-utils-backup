@@ -380,6 +380,12 @@ def _strategy_inputs(schema, *, advanced=False):
             )
         else:
             inputs.append(widget(name))
+        if name == "dense_suffix_steps" and "routing_threshold" in specs:
+            inputs.append(io.Float.Input(
+                "dense_step_threshold", optional=True, default=0.0,
+                min=0.0, max=4.0, step=0.1,
+                tooltip="Attention during dense_prefix_steps and dense_suffix_steps: 0 uses dense attention; a positive value uses Sol with this threshold. Normal steps keep routing_threshold. Dense layer protection still applies.",
+            ))
     return inputs
 
 

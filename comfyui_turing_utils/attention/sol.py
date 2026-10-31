@@ -72,12 +72,16 @@ def make_sparse_attention_override(
     debug_route_density: bool = False,
     dense_backend: str = "w8a8",
     dense_override: Callable | None = None,
+    dense_step_threshold: float = 0.0,
 ) -> Callable:
     min_sequence_tokens, prefix_policy, manual_prefix_tokens = _sparse_options(
         min_sequence_tokens,
         prefix_policy,
         manual_prefix_tokens,
     )
+    dense_step_threshold = float(dense_step_threshold)
+    if not math.isfinite(dense_step_threshold) or dense_step_threshold < 0:
+        raise ValueError("dense_step_threshold must be finite and non-negative")
     routing_threshold = float(routing_threshold)
     skipped_residual = str(skipped_residual).strip().lower()
     sparse_reference_image = bool(sparse_reference_image)
@@ -140,6 +144,11 @@ def make_sparse_attention_override(
         supports_semantic_sparse=True,
     )
 
+    def threshold_for(transformer_options):
+        if dense_step_threshold != 0 and schedule.dense_step(transformer_options):
+            return dense_step_threshold
+        return routing_threshold
+
     def route_debug_context(transformer_options, kernel_key: tuple):
         schedule_state = schedule_state_for(transformer_options)
         layer_index, layer_count = _attention_layer_metadata(transformer_options)
@@ -164,6 +173,7 @@ def make_sparse_attention_override(
             and 0 <= last_sparse_layer < layer_count
         )
         return {
+            "routing_threshold": threshold_for(transformer_options),
             "collect": debug_route_density
             and (aggregate or kernel_key not in debug_route_keys),
             "aggregate": aggregate,
@@ -181,6 +191,7 @@ def make_sparse_attention_override(
         kernel_key: tuple,
         context: dict,
     ) -> None:
+        threshold = context["routing_threshold"]
         protected_query_tokens = sum(
             stop - start for start, stop in sol_call.dense_query_ranges
         )
@@ -235,7 +246,7 @@ def make_sparse_attention_override(
                 sol_call.attention.key_tokens,
                 sol_call.attention.heads,
                 sol_call.attention.kv_heads,
-                routing_threshold,
+                threshold,
                 protected_query_tokens,
                 skipped_residual,
             )
@@ -255,7 +266,7 @@ def make_sparse_attention_override(
             selected_blocks,
             possible_blocks,
             selected_blocks / possible_blocks if possible_blocks else 0.0,
-            routing_threshold,
+            threshold,
             protected_query_tokens,
             skipped_residual,
             context["step"],
@@ -265,12 +276,42 @@ def make_sparse_attention_override(
         )
         debug_route_keys.add(kernel_key)
 
+    def dense_selected(transformer_options):
+        schedule_state = schedule_state_for(transformer_options)
+        dense_schedule = (dense_step_threshold == 0
+                          and schedule.dense_step(transformer_options))
+        dense_layer = schedule.dense_layer(transformer_options)
+        if debug_route_density and dense_schedule:
+            debug_key = f"schedule:{schedule_state.get('step')}"
+            if debug_key not in debug_dense_reasons:
+                LOG.info(
+                    "[Sol sparse debug] dense backend selected by schedule: "
+                    "step=%s/%s prefix_steps=%s suffix_steps=%s",
+                    schedule_state.get("step"),
+                    schedule_state.get("sampling_steps"),
+                    schedule_state.get("prefix_steps"),
+                    schedule_state.get("suffix_steps"),
+                )
+                debug_dense_reasons.add(debug_key)
+        if debug_route_density and dense_layer:
+            layer_index, layer_count = _attention_layer_metadata(transformer_options)
+            debug_key = f"layer:{layer_index}"
+            if debug_key not in debug_dense_reasons:
+                LOG.info(
+                    "[Sol sparse debug] dense backend selected for protected layer %s/%s",
+                    layer_index,
+                    layer_count,
+                )
+                debug_dense_reasons.add(debug_key)
+        return dense_schedule or dense_layer
+
     def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
         reason = sparse_capabilities.unsupported_reason(request)
         if reason is not None:
             return AttentionExecutionOutcome.unsupported(reason)
         transformer_options = request.transformer_options
-        if schedule.is_dense(transformer_options):
+        threshold = threshold_for(transformer_options)
+        if dense_selected(transformer_options):
             return run_dense_prepared(request)
 
         query_view, key_view, value_view = request.peek_qkv()
@@ -319,7 +360,7 @@ def make_sparse_attention_override(
             qk,
             value,
             sol_call,
-            routing_threshold=routing_threshold,
+            routing_threshold=threshold,
             scale=request.scale,
             use_w8a8=use_w8a8,
         )
@@ -330,7 +371,7 @@ def make_sparse_attention_override(
             sol_call.attention.key_tokens,
             sol_call.dense_query_ranges,
             sol_call.exact_kv_ranges,
-            routing_threshold,
+            threshold,
             sol_call.residual_subblocks,
             use_w8a8,
         )
@@ -360,6 +401,7 @@ def make_sparse_attention_override(
         transformer_options,
     ) -> AttentionExecutionOutcome:
         """Finish attention from row-streamed Q/K INT8 and retained V BF16."""
+        threshold = threshold_for(transformer_options)
         if (
             not use_w8a8
             or not torch.is_tensor(value)
@@ -386,7 +428,7 @@ def make_sparse_attention_override(
                 transformer_options=transformer_options,
             )
 
-        if schedule.is_dense(transformer_options):
+        if dense_selected(transformer_options):
             return dense_result()
 
         sol_call, reason = inspect_sol_attention_call(
@@ -419,7 +461,7 @@ def make_sparse_attention_override(
             qk,
             value,
             sol_call,
-            routing_threshold=routing_threshold,
+            routing_threshold=threshold,
             scale=None,
             use_w8a8=True,
         )
@@ -429,7 +471,7 @@ def make_sparse_attention_override(
             sol_call.attention.key_tokens,
             sol_call.dense_query_ranges,
             sol_call.exact_kv_ranges,
-            routing_threshold,
+            threshold,
             sol_call.residual_subblocks,
             True,
         )
@@ -459,32 +501,9 @@ def make_sparse_attention_override(
             original, *fallback_args, **fallback_kwargs
         )
         transformer_options = kwargs.get("transformer_options")
+        threshold = threshold_for(transformer_options)
         schedule_state = schedule_state_for(transformer_options)
-        dense_schedule = schedule.dense_step(transformer_options)
-        dense_layer = schedule.dense_layer(transformer_options)
-        if debug_route_density and dense_schedule:
-            debug_key = f"schedule:{schedule_state.get('step')}"
-            if debug_key not in debug_dense_reasons:
-                LOG.info(
-                    "[Sol sparse debug] dense backend selected by schedule: "
-                    "step=%s/%s prefix_steps=%s suffix_steps=%s",
-                    schedule_state.get("step"),
-                    schedule_state.get("sampling_steps"),
-                    schedule_state.get("prefix_steps"),
-                    schedule_state.get("suffix_steps"),
-                )
-                debug_dense_reasons.add(debug_key)
-        if debug_route_density and dense_layer:
-            layer_index, layer_count = _attention_layer_metadata(transformer_options)
-            debug_key = f"layer:{layer_index}"
-            if debug_key not in debug_dense_reasons:
-                LOG.info(
-                    "[Sol sparse debug] dense backend selected for protected layer %s/%s",
-                    layer_index,
-                    layer_count,
-                )
-                debug_dense_reasons.add(debug_key)
-        if dense_schedule or dense_layer:
+        if dense_selected(transformer_options):
             return fallback(*args, **kwargs)
         debug_context = None
         if debug_route_density:
@@ -505,7 +524,7 @@ def make_sparse_attention_override(
             fallback,
             *args,
             min_sequence_tokens=min_sequence_tokens,
-            routing_threshold=routing_threshold,
+            routing_threshold=threshold,
             prefix_policy=prefix_policy,
             manual_prefix_tokens=manual_prefix_tokens,
             skipped_residual=skipped_residual,
@@ -534,7 +553,8 @@ def make_sparse_attention_override(
             **kwargs,
         ):
             transformer_options = kwargs.get("transformer_options")
-            if schedule.is_dense(transformer_options):
+            threshold = threshold_for(transformer_options)
+            if dense_selected(transformer_options):
                 return run_dense_container(
                     q,
                     k,
@@ -584,7 +604,7 @@ def make_sparse_attention_override(
                 key,
                 value,
                 sol_call,
-                routing_threshold=routing_threshold,
+                routing_threshold=threshold,
                 scale=kwargs.get("scale"),
                 use_w8a8=use_w8a8,
             )
@@ -595,7 +615,7 @@ def make_sparse_attention_override(
                 sol_call.attention.key_tokens,
                 sol_call.dense_query_ranges,
                 sol_call.exact_kv_ranges,
-                routing_threshold,
+                threshold,
                 sol_call.residual_subblocks,
                 use_w8a8,
             )

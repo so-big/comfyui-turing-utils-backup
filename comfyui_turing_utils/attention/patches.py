@@ -118,6 +118,7 @@ def apply_sparse_attention_patch(
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
+    dense_step_threshold: float = 0.0,
 ):
     runtime = attention_base_runtime(model)
     override = make_sparse_attention_override(
@@ -137,6 +138,7 @@ def apply_sparse_attention_patch(
         debug_route_density=debug_route_density,
         dense_backend=runtime.dense_backend,
         dense_override=runtime.dense_override,
+        dense_step_threshold=dense_step_threshold,
     )
     patched = install_attention_strategy(
         model,

@@ -28,13 +28,25 @@ function migrateVPack(data) {
   return migrated;
 }
 
+function migrateDenseStepThreshold(data) {
+  const values = data.widgets_values;
+  if (!Array.isArray(values) || values[0] !== "sol") return data;
+  const prefixWidgets = { auto: 3, none: 0, manual: 1 }[values[2]];
+  if (prefixWidgets === undefined || values.length !== 10 + prefixWidgets) return data;
+  // The added widget sits after dense_suffix_steps in old Sol layouts.
+  const index = 6 + prefixWidgets;
+  return { ...data, widgets_values: [
+    ...values.slice(0, index), 0, ...values.slice(index),
+  ] };
+}
+
 app.registerExtension({
   name: "TuringUtils.Attention",
   beforeRegisterNodeDef(nodeType, data) {
     if (data.name !== "TuringUtilsAttentionStrategy") return;
     const configure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (data, ...args) {
-      return configure.call(this, migrateVPack(data), ...args);
+      return configure.call(this, migrateDenseStepThreshold(migrateVPack(data)), ...args);
     };
   },
 });

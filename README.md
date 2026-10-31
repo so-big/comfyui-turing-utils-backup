@@ -596,6 +596,9 @@ original loading functions; callers bypassing the prompt server must invoke
   W8A8 selects integer sparse PV, while Sage/SDPA select the floating FP16
   sparse core. Dense prefix/suffix counts span both stages of H3 KSampler as
   one task. Ordinary independent sampler nodes still count locally per invocation.
+  `dense_step_threshold` defaults to `0` (dense). A positive value uses Sol
+  with that threshold during dense prefix/suffix steps; ordinary steps keep
+  `routing_threshold`. Dense first/last-layer protection still applies.
 - The SLA strategy implements the MiniMax H3 Turbo-SLA runtime as
   fixed-budget 128-query by 64-key Top-K routing. It shares Sol's semantic
   reference protection, dense step/layer scheduling, fused Q/K preprocessing,

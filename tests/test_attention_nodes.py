@@ -118,6 +118,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             debug_route_density=False,
             dense_backend="w8a8",
             dense_override=mock.ANY,
+            dense_step_threshold=0.0,
         )
 
     def test_sla_schema_matches_semantic_sparse_controls(self):
