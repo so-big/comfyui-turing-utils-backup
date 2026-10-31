@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 import torch
 
@@ -176,6 +177,31 @@ class AttentionRuntimeTest(unittest.TestCase):
             )
         )
 
+    def test_strategy_survives_filtered_runtime_metadata_without_changing_sibling(self):
+        dense = lambda *args, **kwargs: "dense"
+        sol = lambda *args, **kwargs: "sol"
+        sol.container_function = lambda *args, **kwargs: "sol-container"
+        sol.prepared_attention_executor = lambda request: "sol-prepared"
+        base = attention_runtime.AttentionRuntimeConfig("sdpa", "test", dense)
+        upstream = {}
+        attention_runtime.install_attention_runtime(upstream, base)
+        branch = upstream.copy()
+        attention_runtime.install_attention_runtime(
+            branch, base.with_strategy("sol", "test:sol", sol)
+        )
+        filtered = {"optimized_attention_override": branch["optimized_attention_override"]}
+        self.assertEqual(
+            filtered["optimized_attention_override"](None, transformer_options=filtered),
+            "sol",
+        )
+        dispatcher = filtered["optimized_attention_override"]
+        self.assertEqual(dispatcher.container_function(None, None, None, 1), "sol-container")
+        self.assertEqual(
+            dispatcher.prepared_attention_executor(SimpleNamespace(transformer_options={})),
+            "sol-prepared",
+        )
+        self.assertEqual(upstream["optimized_attention_override"](None), "dense")
+
     def test_dispatcher_switches_strategy_without_reinstalling_itself(self):
         def dense(original, *args, **kwargs):
             return "dense"
@@ -239,7 +265,7 @@ class AttentionRuntimeTest(unittest.TestCase):
         )
         self.assertIsNot(replacement_dispatcher, dispatcher)
 
-    def test_strategy_branch_inherits_sdpa_and_reuses_loader_dispatcher(self):
+    def test_strategy_branch_inherits_sdpa_without_reusing_dense_fallback(self):
         model = FakePatcher()
 
         def dense(original, *args, **kwargs):
@@ -270,7 +296,7 @@ class AttentionRuntimeTest(unittest.TestCase):
 
         patched_options = patched.model_options["transformer_options"]
         config = attention_runtime.attention_runtime_config(patched_options)
-        self.assertIs(patched_options["optimized_attention_override"], dispatcher)
+        self.assertIsNot(patched_options["optimized_attention_override"], dispatcher)
         self.assertEqual(config.strategy, "sol")
         self.assertEqual(config.dense_backend, "sdpa")
         self.assertIs(config.dense_override, dense)
@@ -324,7 +350,7 @@ class AttentionRuntimeTest(unittest.TestCase):
 
                 patched_options = patched.model_options["transformer_options"]
                 config = attention_runtime.attention_runtime_config(patched_options)
-                self.assertIs(
+                self.assertIsNot(
                     patched_options["optimized_attention_override"], dispatcher
                 )
                 self.assertEqual(config.strategy, strategy)

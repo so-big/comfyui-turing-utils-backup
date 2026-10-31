@@ -1,8 +1,8 @@
 """Unified dense/strategy attention runtime dispatch.
 
 The model-side attention hand-off is installed once. Subsequent strategy
-nodes replace only the immutable runtime configuration carried in
-``transformer_options``; the dispatcher and model object patches stay stable.
+nodes replace the immutable runtime configuration and bind a dispatcher to
+that branch; model object patches stay stable.
 """
 
 from __future__ import annotations
@@ -112,15 +112,18 @@ def _active_override(transformer_options, fallback: Callable) -> Callable:
     return config.active_override if config is not None else fallback
 
 
-def make_attention_runtime_dispatcher(dense_override: Callable) -> Callable:
-    """Create one stable dispatcher for every strategy using a dense base."""
+def make_attention_runtime_dispatcher(
+    dense_override: Callable, *, active_override: Callable | None = None
+) -> Callable:
+    """Dispatch runtime options, retaining this branch's selection as fallback."""
+    fallback = active_override if active_override is not None else dense_override
 
     def attention_override(original: Callable, *args, **kwargs):
-        target = _active_override(kwargs.get("transformer_options"), dense_override)
+        target = _active_override(kwargs.get("transformer_options"), fallback)
         return target(original, *args, **kwargs)
 
     def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
-        target = _active_override(request.transformer_options, dense_override)
+        target = _active_override(request.transformer_options, fallback)
         executor = getattr(target, "prepared_attention_executor", None)
         if not callable(executor):
             return AttentionExecutionOutcome.unsupported(
@@ -129,7 +132,7 @@ def make_attention_runtime_dispatcher(dense_override: Callable) -> Callable:
         return executor(request)
 
     def container_function(q, k, v, heads: int, *args, **kwargs):
-        target = _active_override(kwargs.get("transformer_options"), dense_override)
+        target = _active_override(kwargs.get("transformer_options"), fallback)
         container = getattr(target, "container_function", None)
         if not callable(container):
             # This is only a compatibility path for third-party dense
@@ -161,7 +164,7 @@ def make_attention_runtime_dispatcher(dense_override: Callable) -> Callable:
             qk_transform,
             transformer_options,
         ) -> AttentionExecutionOutcome:
-            target = _active_override(transformer_options, dense_override)
+            target = _active_override(transformer_options, fallback)
             executor = getattr(target, "prepared_attention_executor", None)
             streamed = getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
             if not callable(streamed):
@@ -190,6 +193,7 @@ def make_attention_runtime_dispatcher(dense_override: Callable) -> Callable:
         "turing_attention_runtime_v2"
     )
     attention_override.turing_utils_dense_override = dense_override
+    attention_override.turing_utils_active_override = fallback
     setattr(attention_override, ATTENTION_RUNTIME_DISPATCHER_ATTR, True)
     return attention_override
 
@@ -212,10 +216,14 @@ def install_attention_runtime(
             is_attention_runtime_dispatcher(current)
             and getattr(current, "turing_utils_dense_override", None)
             is config.dense_override
+            and getattr(current, "turing_utils_active_override", None)
+            is config.active_override
         ):
             dispatcher = current
         else:
-            dispatcher = make_attention_runtime_dispatcher(config.dense_override)
+            dispatcher = make_attention_runtime_dispatcher(
+                config.dense_override, active_override=config.active_override
+            )
     transformer_options[ATTENTION_RUNTIME_CONFIG_KEY] = config
     transformer_options["optimized_attention_override"] = dispatcher
 
